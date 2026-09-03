@@ -1,0 +1,19 @@
+services:
+  spark-smoke-test:
+    image: apache/spark:3.5.8-scala2.12-java17-python3-ubuntu
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - local[2]
+      - /opt/spark/work-dir/smoke_test.py
+    volumes:
+      - type: bind
+        source: ./streaming/smoke_test.py
+        target: /opt/spark/work-dir/smoke_test.py
+        read_only: true
+    networks:
+      - ecosistema-network
+
+networks:
+  ecosistema-network:
+    external: true
