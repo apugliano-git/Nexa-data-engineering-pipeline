@@ -326,3 +326,233 @@ los eventos que consume y, en Hito 2, conserva una copia cruda en Delta bronze.
 Más adelante será la herramienta para transformar esa evidencia en datos
 curados. Esa es la parte que quiero aprender porque conecta directamente con
 el trabajo de Data Engineering y con el uso de Spark dentro de Databricks.
+
+## 15. Hito 2 — aprendizaje, decisiones y verificación
+
+### 15.1 Cómo se construyó el aprendizaje
+
+Este hito se trabajó de forma interactiva y en partes cortas. No intenté leer
+todo de una vez: fui explicando con mis palabras lo que entendía, recibiendo
+correcciones y volviendo a explicar los puntos que todavía confundía. La
+bitácora debe conservar ese recorrido, incluidas las dudas que ayudaron a
+afinar el modelo mental.
+
+Al principio entendía un tópico como un lugar donde Ratchet registra sus
+transacciones, y pensaba que una `resourceId` mandaba cada recurso a su propia
+partición. La corrección importante fue que la key se usa para decidir la
+partición, pero muchos recursos pueden compartir una misma partición; lo que
+se conserva es el orden dentro de esa partición. Los offsets son posiciones
+incrementales asignadas por el broker dentro de cada partición: distintos
+recursos pueden quedar intercalados, por ejemplo `a1, b1, a2`, sin perder el
+orden de cada partición.
+
+También pregunté si Redpanda necesitaba guardar todo en memoria y por qué no
+se agotaba la RAM. La respuesta que me quedó es que Redpanda persiste el log y
+usa memoria acotada para operar; los consumidores no reciben todo de una vez.
+Spark consulta y procesa tramos limitados en micro-batches. Si los productores
+van más rápido, puede crecer el retraso del consumidor, pero no existe un
+protocolo mágico que ponga Nexa al día: Spark procesa el backlog según su
+capacidad y la configuración de la fuente.
+
+Otro ajuste importante fue separar Kafka de Redpanda. Redpanda es el broker
+que Nexa tiene disponible y Kafka es la API/protocolo compatible que permite
+que productores y consumidores hablen con él. Spark y notification-service son
+consumidores independientes; no deben compartir el mismo consumer group si
+ambos necesitan recibir todos los eventos, porque un grupo reparte las
+particiones entre sus miembros.
+
+La tabla y el orden jerárquico fueron especialmente útiles para mí. El flujo
+conceptual quedó así:
+
+    Ratchet produce hechos de negocio
+            ↓
+    Redpanda, broker compatible con Kafka
+            ↓
+    tópico → particiones → registros con key, value y offset
+            ↓
+    grupos de consumidores independientes
+            ↓
+    consulta continua de Spark
+            ↓
+    micro-batches → tabla Delta Bronze
+
+La diferencia entre un evento del negocio y un registro técnico también quedó
+más clara. Un hold puede tener varios eventos —creado, confirmado, liberado,
+expirado o rechazado—. `eventId` identifica cada evento; `holdId` identifica el
+hold al que se refiere. Por eso dos mensajes con el mismo `holdId` y distintos
+`eventId` pueden ser dos eventos válidos del ciclo de vida, no un duplicado.
+Un duplicado de entrega es volver a leer el mismo registro, identificado por
+su posición Kafka y normalmente por su `eventId`.
+
+En Bronze, primero confundí el payload con el evento completo y después
+entendí que es un campo dentro del JSON `value`; su contenido depende del tipo
+de evento. También confundí Data Lake, Delta Lake y Bronze como niveles
+secuenciales de sofisticación. La corrección es que el Data Lake describe el
+almacenamiento, Delta Lake aporta el formato y las capacidades de tabla,
+transacciones e historial, y Bronze es la primera capa lógica de datos crudos
+organizados sobre ese almacenamiento. Bronze conserva el JSON original, no lo
+convierte todavía en métricas Silver o Gold.
+
+Finalmente entendí que el checkpoint no es Bronze: Bronze guarda los datos y
+el checkpoint guarda el estado operativo de la consulta para poder continuar.
+`startingOffsets=latest` sirve para decidir el punto inicial de una consulta
+nueva; cuando ya existe checkpoint, Spark recupera desde ese checkpoint y no
+vuelve a usar `startingOffsets` para resetearla.
+
+Hay tres situaciones distintas que antes estaba metiendo bajo la palabra
+“duplicado”. Primero, Spark puede releer o reintentar el mismo micro-batch si
+falla antes de terminar el ciclo de progreso. Segundo, el sink nativo de Delta
+coordina su log transaccional con el progreso de Structured Streaming: con la
+misma consulta y el mismo checkpoint, el commit del mismo batch es idempotente
+y no debería agregar otra vez sus filas. La [documentación oficial de Delta
+sobre streaming](https://docs.delta.io/delta-streaming/) describe esta
+propiedad de exactly-once del sink nativo.
+
+Tercero, un productor puede publicar dos veces el mismo hecho de negocio. Si
+son dos registros Kafka con offsets distintos, Delta recibe dos entradas
+distintas y Bronze conserva ambas. Eso no es una relectura del mismo batch y
+no se resuelve con el commit idempotente del sink. En este hito no se hace
+deduplicación de negocio porque Bronze debe conservar la evidencia cruda. Esta
+sesión no forzó una caída exactamente durante un commit, así que la propiedad
+del sink está documentada y razonada, no presentada como una prueba local de
+una caída.
+
+Para próximos hitos, la forma de explicación que mejor me funcionó fue:
+
+- resumir primero dónde estoy parado en el ciclo completo;
+- usar tablas, jerarquías y flujos cuando haya varias capas o relaciones;
+- avanzar en bloques cortos y pedirme que reconstruya cada concepto con mis
+  palabras;
+- corregir explícitamente los errores, incluyendo la diferencia entre palabras
+  parecidas como evento, payload, `eventId` y `holdId`;
+- incorporar mis dudas reales en el resumen final, para que la bitácora siga
+  siendo útil dentro de unos meses.
+
+### 15.2 Decisiones aprobadas
+
+- Construir únicamente `Redpanda → Spark Structured Streaming → Delta Lake
+  Bronze`.
+- Crear `streaming/bronze_ingest.py` y agregar el servicio `spark-bronze` sin
+  retirar ni alterar `spark-smoke-test`.
+- Consumir exclusivamente `reservation.events.v1` desde `redpanda:29092`.
+- Reutilizar la imagen existente de Spark 3.5.8, Scala 2.12, Java 17, Python
+  3.10 y `local[2]`.
+- Usar `org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.8` y
+  `io.delta:delta-spark_2.12:3.3.0`. La compatibilidad se contrastó con la
+  [matriz oficial de releases de Delta Lake](https://docs.delta.io/releases/),
+  la [documentación oficial de integración Kafka de Spark 3.5.8](https://spark.apache.org/docs/3.5.8/structured-streaming-kafka-integration.html)
+  y la [compatibilidad Kafka de Redpanda](https://docs.redpanda.com/streaming/current/develop/kafka-clients/).
+- Configurar las extensiones de Delta y usar una consulta continua con salida
+  `append`.
+- Mantener exactamente estas columnas Bronze: `key STRING`, `value STRING`,
+  `topic STRING`, `partition INT`, `offset LONG` y `timestamp TIMESTAMP`.
+  `value` conserva el JSON completo como texto; no se extraen campos de
+  negocio ni se agrega una columna técnica adicional.
+- Persistir `data/bronze` y `data/checkpoint/bronze` mediante bind mounts
+  locales. `data/` queda ignorado por Git.
+- Preparar esos directorios con un servicio one-shot que corre como root solo
+  durante la creación y ajuste de permisos; el consumer de Spark continúa con
+  su usuario normal UID 185 y no se modifican ni reinicializan los datos
+  existentes.
+- Usar `startingOffsets=latest` en una consulta sin checkpoint y dejar que el
+  checkpoint sea la fuente de recuperación en los reinicios.
+- No implementar deduplicación de negocio, Silver, ventanas, watermark, HLL,
+  anomalías, DuckDB, LLM, FastAPI, Cypher ni cambios en Ratchet.
+- No afirmar exactly-once global ni unicidad de negocio; distinguir la
+  relectura de un batch, el commit idempotente del sink nativo Delta y dos
+  registros Kafka distintos con offsets distintos.
+
+### 15.3 Implementación y ajustes encontrados
+
+La implementación se mantuvo mínima. El job crea la fuente Kafka, proyecta los
+seis campos aprobados, escribe en Delta con modo append y espera continuamente
+con `awaitTermination()`. Registra el topic, broker, rutas de Bronze y
+checkpoint al iniciar, y registra la excepción si la consulta termina con
+error.
+
+La primera ejecución real reveló un problema de entorno que no había que
+ocultar: la imagen ejecuta como el usuario `spark`, cuyo `HOME` es
+`/nonexistent`, y Ivy no podía escribir su caché al resolver `--packages`. La
+corrección mínima fue configurar `spark.jars.ivy=/tmp/.ivy2`; no se agregó una
+dependencia ni una abstracción para resolverlo.
+
+La revisión posterior encontró el mismo tipo de problema en el bind mount: en
+un checkout sin `data/`, Docker crea el directorio como `root:root` y UID 185
+no puede crear el checkpoint. La corrección fue agregar `spark-bronze-init`, un
+servicio one-shot que corre como root solo para crear
+`data/bronze` y `data/checkpoint/bronze`, cambiar el propietario de esos
+directorios a `185:185` y establecer `0755`. No ejecuta Spark como root, no usa
+`chmod 777`, no borra archivos y no aplica `chown -R` al contenido existente.
+
+### 15.4 Evidencia de verificación
+
+- `docker compose config --quiet` terminó correctamente después del cambio.
+- `docker compose pull spark-smoke-test` terminó correctamente.
+- El smoke test del Hito 1 volvió a pasar con:
+
+      NEXA_SMOKE_TEST_OK spark=3.5.8 python=3.10.12 java=17.0.17 master=local[2] count=1
+
+- Se levantó Redpanda desde el Compose de infraestructura de Ratchet y se
+  conectó su contenedor existente a `ecosistema-network` sin modificar ese
+  repositorio. `rpk cluster info` confirmó el broker `redpanda:29092`.
+- Se creó `reservation.events.v1` con una partición para la prueba controlada.
+  La publicación de tres eventos produjo `partition=0 offset=0`, `1` y `2`.
+- `spark-bronze` quedó en estado `Up`, resolvió y cargó los artefactos Kafka y
+  Delta, y registró el arranque con el topic, broker y rutas esperadas.
+- El fallo de permisos se reprodujo en un checkout temporal sin `data/`: el
+  contenedor terminó con `java.io.IOException: mkdir of
+  file:/opt/nexa/data/checkpoint/bronze failed` y el directorio era `root:root`.
+  Luego de agregar el inicializador, los mismos pasos públicos del README
+  crearon los directorios, el inicializador terminó con código `0` y
+  `spark-bronze` arrancó con su usuario normal `spark` (UID 185).
+- Sobre el workspace existente, el inicializador terminó con código `0` y los
+  hashes de los logs Delta y offsets del checkpoint se mantuvieron sin cambios.
+- La consulta Delta devolvió estas filas, verificadas por
+  `topic + partition + offset`:
+
+      reservation.events.v1  0  0  resource-h2-1  nexa-h2-event-1
+      reservation.events.v1  0  1  resource-h2-1  nexa-h2-event-2
+      reservation.events.v1  0  2  resource-h2-2  nexa-h2-event-3
+
+  El campo `value` conservó el JSON completo, incluidos `eventId`,
+  `eventType`, `resourceId`, `holderRef` y `payload`.
+  La lectura final incluyó también `timestamp` y mostró valores no nulos para
+  los cuatro registros; los tres primeros compartieron el timestamp de
+  publicación de su batch y el cuarto tuvo el timestamp posterior de su
+  publicación.
+- Se detuvo el consumer sin borrar `data/`. Antes del reinicio,
+  `data/checkpoint/bronze/offsets/1` registraba el fin `{"0":3}` para el
+  topic. Después del reinicio, el checkpoint generó `offsets/2` con
+  `{"0":4}`.
+- Se publicó un cuarto evento y Redpanda asignó `partition=0 offset=3`.
+  Bronze lo mostró con ese offset junto a los tres registros anteriores. Una
+  consulta por `eventId` devolvió una fila para cada uno de los cuatro IDs;
+  ningún ID controlado se reinsertó en este reinicio ordenado.
+- El test local `streaming/test_bronze_ingest.py` pasó con
+  `NEXA_BRONZE_PROJECTION_TEST_OK`, comprobando la proyección exacta de los
+  seis campos y la preservación del JSON.
+- `data/` contiene únicamente datos Delta y archivos operativos del checkpoint,
+  y quedó excluido por `.gitignore`.
+
+### 15.5 Límites y pendientes
+
+La verificación del camino Kafka-to-Bronze se hizo con eventos controlados
+publicados mediante `rpk`. Ratchet y sus microservicios no estaban levantados
+en esta sesión, por lo que no se verificó el recorrido end-to-end desde una
+operación HTTP de Ratchet ni se ejecutaron scripts k6. Eso no invalida la
+integración real con Redpanda, pero deja esa validación adicional pendiente.
+
+La prueba de reinicio demuestra recuperación con datos y checkpoint conservados
+durante un stop ordenado, y en esa ejecución no reinsertó los cuatro `eventId`
+controlados. No forcé una caída en el momento crítico. La documentación de
+Delta respalda la idempotencia del commit del sink nativo para la misma consulta
+y checkpoint, pero eso no es una promesa de exactly-once global ni de unicidad
+de negocio: dos publicaciones Kafka con offsets distintos siguen siendo dos
+filas posibles en Bronze.
+
+La prueba usó una sola partición y no pretende demostrar balanceo entre
+particiones o carga sostenida. El Compose de Ratchet todavía no declara la red
+compartida: la conexión de Redpanda se hizo dinámicamente y debe repetirse si
+el contenedor es recreado. Ratchet quedó sin modificaciones.
+
+Los cambios se dejaron sin commit para una revisión independiente posterior.

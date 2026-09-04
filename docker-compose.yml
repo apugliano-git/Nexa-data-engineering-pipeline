@@ -14,6 +14,50 @@ services:
     networks:
       - ecosistema-network
 
+  spark-bronze:
+    image: apache/spark:3.5.8-scala2.12-java17-python3-ubuntu
+    depends_on:
+      spark-bronze-init:
+        condition: service_completed_successfully
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - local[2]
+      - --packages
+      - org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.8,io.delta:delta-spark_2.12:3.3.0
+      - --conf
+      - spark.jars.ivy=/tmp/.ivy2
+      - --conf
+      - spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension
+      - --conf
+      - spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog
+      - /opt/spark/work-dir/bronze_ingest.py
+    volumes:
+      - type: bind
+        source: ./streaming/bronze_ingest.py
+        target: /opt/spark/work-dir/bronze_ingest.py
+        read_only: true
+      - type: bind
+        source: ./data
+        target: /opt/nexa/data
+    networks:
+      - ecosistema-network
+
+  spark-bronze-init:
+    image: apache/spark:3.5.8-scala2.12-java17-python3-ubuntu
+    user: "0:0"
+    command:
+      - /bin/sh
+      - -c
+      - |
+        mkdir -p /opt/nexa/data/bronze /opt/nexa/data/checkpoint/bronze
+        chown 185:185 /opt/nexa/data /opt/nexa/data/bronze /opt/nexa/data/checkpoint /opt/nexa/data/checkpoint/bronze
+        chmod 0755 /opt/nexa/data /opt/nexa/data/bronze /opt/nexa/data/checkpoint /opt/nexa/data/checkpoint/bronze
+    volumes:
+      - type: bind
+        source: ./data
+        target: /opt/nexa/data
+
 networks:
   ecosistema-network:
     external: true
