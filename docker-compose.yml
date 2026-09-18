@@ -43,6 +43,36 @@ services:
     networks:
       - ecosistema-network
 
+  spark-silver:
+    image: apache/spark:3.5.8-scala2.12-java17-python3-ubuntu
+    depends_on:
+      spark-bronze-init:
+        condition: service_completed_successfully
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        until [ -d /opt/nexa/data/bronze/_delta_log ]; do
+          echo 'Waiting for the Bronze Delta table'; sleep 1;
+        done;
+        exec /opt/spark/bin/spark-submit
+        --master local[2]
+        --packages io.delta:delta-spark_2.12:3.3.0
+        --conf spark.jars.ivy=/tmp/.ivy2
+        --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension
+        --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog
+        /opt/spark/work-dir/silver_aggregate.py
+    volumes:
+      - type: bind
+        source: ./streaming/silver_aggregate.py
+        target: /opt/spark/work-dir/silver_aggregate.py
+        read_only: true
+      - type: bind
+        source: ./data
+        target: /opt/nexa/data
+    networks:
+      - ecosistema-network
+
   spark-bronze-init:
     image: apache/spark:3.5.8-scala2.12-java17-python3-ubuntu
     user: "0:0"
@@ -50,9 +80,9 @@ services:
       - /bin/sh
       - -c
       - |
-        mkdir -p /opt/nexa/data/bronze /opt/nexa/data/checkpoint/bronze
-        chown 185:185 /opt/nexa/data /opt/nexa/data/bronze /opt/nexa/data/checkpoint /opt/nexa/data/checkpoint/bronze
-        chmod 0755 /opt/nexa/data /opt/nexa/data/bronze /opt/nexa/data/checkpoint /opt/nexa/data/checkpoint/bronze
+        mkdir -p /opt/nexa/data/bronze /opt/nexa/data/silver /opt/nexa/data/checkpoint/bronze /opt/nexa/data/checkpoint/silver
+        chown 185:185 /opt/nexa/data /opt/nexa/data/bronze /opt/nexa/data/silver /opt/nexa/data/checkpoint /opt/nexa/data/checkpoint/bronze /opt/nexa/data/checkpoint/silver
+        chmod 0755 /opt/nexa/data /opt/nexa/data/bronze /opt/nexa/data/silver /opt/nexa/data/checkpoint /opt/nexa/data/checkpoint/bronze /opt/nexa/data/checkpoint/silver
     volumes:
       - type: bind
         source: ./data

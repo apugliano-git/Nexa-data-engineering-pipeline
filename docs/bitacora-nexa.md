@@ -556,3 +556,101 @@ compartida: la conexión de Redpanda se hizo dinámicamente y debe repetirse si
 el contenedor es recreado. Ratchet quedó sin modificaciones.
 
 Los cambios se dejaron sin commit para una revisión independiente posterior.
+
+## 16. Hito 3 — aprendizaje, decisiones y verificación
+
+### 16.1 Qué entendí antes de implementar
+
+La primera aclaración fue separar la responsabilidad de las capas. `value` es
+el JSON del evento que Ratchet publicó; Bronze lo conserva crudo junto con la
+traza técnica de Kafka. Bronze es evidencia de entrada y no se modifica para
+que Silver pueda corregirlo. Silver lee Bronze mediante otra consulta de Spark
+y produce una vista curada para medir, sin borrar ni reescribir la fuente.
+
+También separé tres tiempos distintos: `occurredAt` indica cuándo ocurrió el
+hecho de negocio; el timestamp de Kafka indica cuándo el broker registró el
+mensaje; y el tiempo de procesamiento indica cuándo Spark lo observó. Silver
+usa `occurredAt`, porque las ventanas deben representar el tiempo del evento y
+no el momento en que Spark llegó a procesarlo.
+
+Una ventana *tumbling* divide el tiempo en bloques consecutivos de cinco
+minutos (`00–05`, `05–10`, etc.). Una ventana *sliding* se solaparía, pero no
+es necesaria para este hito. El watermark tampoco es un temporizador pegado al
+último registro: Spark lo calcula a partir del máximo tiempo de evento que ha
+visto menos cinco minutos. Así puede cerrar estado viejo sin esperar para
+siempre y todavía aceptar datos razonablemente atrasados.
+
+Finalmente distinguí el estado de la consulta, su checkpoint y el log Delta.
+El estado contiene información intermedia de ventanas y deduplicación; el
+checkpoint de Spark guarda el progreso y ese estado para reanudar; el log
+transaccional de Delta registra los commits de las tablas. El conteo de eventos
+no es lo mismo que el conteo de usuarios distintos: `event_count` cuenta
+eventos válidos después de deduplicar `eventId`, mientras que
+`distinct_users` estima valores únicos de `holderRef` con HyperLogLog. HLL
+reduce memoria, pero no deduplica eventos.
+
+### 16.2 Diseño aprobado
+
+- Crear un job independiente en `streaming/silver_aggregate.py`; no cambiar el
+  job de Bronze.
+- Leer la tabla Delta Bronze con `readStream`, incluyendo el snapshot inicial y
+  los commits nuevos, y usar un checkpoint propio en
+  `data/checkpoint/silver`.
+- Parsear el JSON con un esquema explícito. Aceptar `eventVersion = 1` y los
+  cinco tipos del contrato de Ratchet. Exigir los campos de nivel superior y
+  exigir `holdId` salvo para `RESERVATION_REJECTED`, que puede no tenerlo.
+- Dejar los inválidos en Bronze y excluirlos de las métricas. En este hito se
+  observan mediante una salida de consola, sin crear otra tabla de rechazados.
+- Usar ventanas *tumbling* de cinco minutos, watermark de cinco minutos,
+  deduplicación por `eventId` limitada por ese estado y
+  `approx_count_distinct(holderRef, rsd = 0.05)`.
+- Escribir en Silver en modo append las columnas de ventana, tipo de evento,
+  cantidad de eventos y usuarios distintos. No deduplicar por `holdId` ni por
+  `holderRef`.
+- Esperar a que exista `_delta_log` de Bronze antes de iniciar Silver y no
+  reutilizar ni borrar checkpoints.
+
+Quedaron explícitamente fuera las anomalías, Gold/DuckDB, reportes, LLM,
+FastAPI, Cypher y cualquier modificación de Ratchet.
+
+### 16.3 Implementación y ajustes
+
+La implementación agregó el job, una prueba unitaria de parsing/agregación,
+una prueba de integración con tablas Delta temporales y el servicio
+`spark-silver`. El servicio necesita solamente Delta: no consume Kafka porque
+Bronze ya es su fuente.
+
+La primera prueba reveló que `from_json` puede devolver un struct nulo para
+JSON inválido sin distinguirlo por sí solo de campos faltantes. Se agregó una
+comprobación mínima con `get_json_object` para conservar el motivo
+`invalid_json`. La revisión de validación también detectó que un
+`eventVersion` ausente podía pasar por la lógica de tres valores de Spark; se
+lo marca explícitamente como `unsupported_event_version`.
+
+### 16.4 Evidencia de verificación
+
+- `docker compose config --quiet` terminó con código `0` después de agregar
+  `spark-silver` y sus directorios persistentes.
+- `streaming/test_silver_aggregate.py` pasó en Spark 3.5.8 con
+  `NEXA_SILVER_PROJECTION_TESTS_OK`.
+- `streaming/test_silver_stream.py` pasó con Delta Lake 3.3.0 y
+  `NEXA_SILVER_STREAM_TESTS_OK`. Cubrió snapshot inicial, ventanas exactas,
+  evento atrasado dentro del watermark, evento posterior al cierre y
+  recuperación desde checkpoint sin reinsertar una ventana finalizada.
+- La regresión de Hito 2 pasó con `NEXA_BRONZE_PROJECTION_TEST_OK`.
+- El smoke test de Hito 1 pasó con
+  `NEXA_SMOKE_TEST_OK spark=3.5.8 python=3.10.12 java=17.0.17 master=local[2] count=1`.
+
+### 16.5 Límites actuales
+
+Silver no promete que una métrica permanezca abierta indefinidamente: los
+eventos más antiguos que el watermark pueden descartarse del estado de Spark.
+La deduplicación está acotada por esa misma retención y no convierte Bronze en
+una tabla de negocio única. HLL es una aproximación con error relativo
+configurado, no un conteo exacto. Los inválidos siguen auditables en Bronze,
+pero todavía no tienen una tabla de rechazados persistida.
+
+La verificación de este cierre usó Delta local con directorios temporales; no
+se repitió en esta sesión una publicación end-to-end desde Ratchet hacia un
+Redpanda activo. Los cambios de Hito 3 quedaron sin commit hasta una revisión
+final y autorización explícita.

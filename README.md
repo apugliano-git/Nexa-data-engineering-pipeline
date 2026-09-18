@@ -1,14 +1,15 @@
-# Nexa — Milestone 2
+# Nexa — Milestones 2 and 3
 
-Milestone 2 implements the minimum ingestion path:
+Milestones 2 and 3 implement the ingestion and first curation paths:
 
 ```text
-Ratchet → Redpanda reservation.events.v1 → Spark Structured Streaming → Delta Lake Bronze
+Ratchet → Redpanda reservation.events.v1 → Spark Structured Streaming → Delta Lake Bronze → Delta Lake Silver
 ```
 
 Nexa consumes the topic as an independent consumer. It stores one append-only
 Bronze row per Kafka record, preserving the original JSON value and the Kafka
-metadata needed for traceability.
+metadata needed for traceability. Silver reads Bronze as a separate streaming
+query and writes only validated, bounded aggregates; it never changes Bronze.
 
 ## Requirements
 
@@ -35,10 +36,10 @@ the container's temporary `/tmp/.ivy2` directory.
 ## Local storage permissions
 
 The Compose file includes a one-shot `spark-bronze-init` service. It runs as
-root only long enough to create `data/bronze` and
-`data/checkpoint/bronze`, assign those directories to UID/GID `185`, and set
-mode `0755`. It does not delete, replace, or initialize existing Bronze or
-checkpoint files.
+root only long enough to create `data/bronze`, `data/silver`, and both
+checkpoint directories, assign them to UID/GID `185`, and set mode `0755`. It
+does not delete, replace, or initialize existing Bronze, Silver, or checkpoint
+files.
 
 The `spark-bronze` service still runs as the image's default `spark` user. No
 manual `chmod 777` or permanent root execution is required. The initializer is
@@ -112,7 +113,10 @@ The host directories are bind-mounted so they survive container restarts:
 ```text
 data/
 ├── bronze/                  # Delta table data and _delta_log
-└── checkpoint/bronze/       # Spark Structured Streaming checkpoint
+├── silver/                  # Delta table data and _delta_log
+└── checkpoint/
+    ├── bronze/              # Bronze Spark checkpoint
+    └── silver/              # Silver Spark checkpoint
 ```
 
 `data/` is generated local state and is ignored by Git.
@@ -130,6 +134,42 @@ Bronze has exactly these columns:
 
 No business deduplication is performed in Bronze. `eventId`, `eventType`, and
 `holdId` remain inside the raw JSON value for later layers.
+
+## Run Silver aggregation
+
+Start Bronze first. Silver waits for the Bronze Delta log before starting, so
+the two services can also be started together after the initializer exists:
+
+```bash
+docker compose up -d spark-bronze
+docker compose up -d spark-silver
+docker compose logs -f spark-silver
+```
+
+Silver reads the existing Bronze snapshot and later Delta commits through
+`readStream`; it does not consume Kafka and it never updates or deletes Bronze.
+The same Silver checkpoint must stay with the Silver table across restarts.
+
+Silver parses the JSON with an explicit schema and accepts `eventVersion = 1`
+and the five Ratchet event types. All required top-level fields must be
+present; `holdId` is required except for `RESERVATION_REJECTED`, which is a
+valid Ratchet event without one. Invalid rows remain available in Bronze and
+are reported by the Silver query's console warning stream. There is no
+rejected-data table in this milestone.
+
+The Silver output is an append-only Delta table with these columns:
+
+| Column | Meaning |
+|---|---|
+| `window_start`, `window_end` | Five-minute tumbling event-time window |
+| `event_type` | Valid Ratchet event type |
+| `event_count` | Valid events after `eventId` deduplication within the bounded state |
+| `distinct_users` | Approximate distinct `holderRef` count using HLL, `rsd = 0.05` |
+
+The query uses `occurredAt` as event time and a five-minute watermark. A late
+event inside that bound can update an open window; an event arriving after the
+window has been finalized is dropped by Spark's bounded state. HLL saves memory
+for the user estimate; it is not the event deduplication mechanism.
 
 ## Inspect Bronze
 
@@ -201,7 +241,27 @@ docker run --rm -v "$PWD:/workspace:ro" \
   /opt/spark/bin/spark-submit /workspace/streaming/test_bronze_ingest.py
 ```
 
-Milestone 2 includes the continuous Kafka-to-Delta Bronze path, persistent
-storage, checkpoint recovery, and the Milestone 1 smoke test. It does not include
-Silver, business deduplication, windows, watermarks, HLL, anomaly detection,
-DuckDB, LLM features, FastAPI, Cypher, or changes to Ratchet.
+Silver's unit and Delta streaming tests use the same Spark image. The
+integration test also resolves the pinned Delta package:
+
+```bash
+docker run --rm -v "$PWD:/workspace:ro" \
+  apache/spark:3.5.8-scala2.12-java17-python3-ubuntu \
+  /opt/spark/bin/spark-submit --master local[2] \
+  /workspace/streaming/test_silver_aggregate.py
+
+docker run --rm -v "$PWD:/workspace:ro" \
+  apache/spark:3.5.8-scala2.12-java17-python3-ubuntu \
+  /opt/spark/bin/spark-submit --master local[2] \
+  --packages io.delta:delta-spark_2.12:3.3.0 \
+  --conf spark.jars.ivy=/tmp/.ivy2 \
+  --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension \
+  --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog \
+  /workspace/streaming/test_silver_stream.py
+```
+
+Milestones 2 and 3 include the continuous Kafka-to-Delta Bronze path, the
+validated Bronze-to-Silver Delta stream, persistent storage, checkpoint
+recovery, bounded event-time aggregation, and the Milestone 1 smoke test. They
+do not include deterministic anomaly detection, Gold/DuckDB, LLM features,
+FastAPI, Cypher, or changes to Ratchet.
