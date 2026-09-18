@@ -1,8 +1,9 @@
 from datetime import datetime
+from unittest.mock import Mock, patch
 
 from pyspark.sql import Row, SparkSession
 
-from silver_aggregate import aggregate_events, parse_and_validate
+from silver_aggregate import aggregate_events, main, parse_and_validate
 
 
 def spark_session():
@@ -164,6 +165,43 @@ def test_aggregate_deduplicates_event_id_before_counting():
         spark.stop()
 
 
+def test_main_propagates_failure_from_either_stream_and_stops_both():
+    active_spark = spark_session()
+    try:
+        for failed_stream in ("invalid", "silver"):
+            failure = RuntimeError(f"{failed_stream} stream failed")
+            spark = Mock()
+            session = Mock()
+            session.builder.appName.return_value.config.return_value.getOrCreate.return_value = spark
+            spark.streams.awaitAnyTermination.side_effect = failure
+            invalid_query = Mock()
+            silver_query = Mock()
+            parsed = Mock()
+            aggregated = Mock()
+            parsed.filter.return_value.select.return_value.writeStream.format.return_value.outputMode.return_value.option.return_value.start.return_value = invalid_query
+            aggregated.writeStream.format.return_value.outputMode.return_value.option.return_value.start.return_value = silver_query
+            # A failure in either registered query must escape main(). Real
+            # Delta execution and recovery are covered by test_silver_stream.
+            with (
+                patch("silver_aggregate.SparkSession", session),
+                patch("silver_aggregate.parse_and_validate", return_value=parsed),
+                patch("silver_aggregate.aggregate_events", return_value=aggregated),
+                patch("silver_aggregate.logger"),
+            ):
+                try:
+                    main()
+                except RuntimeError as exc:
+                    assert exc is failure
+                else:
+                    raise AssertionError("main ignored a streaming-query failure")
+                spark.streams.awaitAnyTermination.assert_called_once_with()
+                invalid_query.stop.assert_called_once_with()
+                silver_query.stop.assert_called_once_with()
+                spark.stop.assert_called_once_with()
+    finally:
+        active_spark.stop()
+
+
 if __name__ == "__main__":
     for test in (
         test_parse_and_validate_accepts_rejected_without_hold_id,
@@ -172,6 +210,7 @@ if __name__ == "__main__":
         test_aggregate_excludes_invalid_rows,
         test_aggregate_counts_events_and_distinct_users_in_exact_tumbling_windows,
         test_aggregate_deduplicates_event_id_before_counting,
+        test_main_propagates_failure_from_either_stream_and_stops_both,
     ):
         test()
     print("NEXA_SILVER_PROJECTION_TESTS_OK")

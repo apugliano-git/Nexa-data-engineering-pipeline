@@ -109,6 +109,8 @@ def aggregate_events(events_df: DataFrame, with_watermark: bool = True) -> DataF
     if with_watermark:
         valid_events = valid_events.withWatermark("occurredAt", WATERMARK_DELAY)
 
+    # ponytail: IDs are retained for this checkpoint's lifetime; durable
+    # event-level deduplication needs a separately reviewed migration.
     deduplicated = valid_events.dropDuplicates(["eventId"])
     return (
         deduplicated.groupBy(window("occurredAt", WINDOW_DURATION), "eventType")
@@ -150,7 +152,6 @@ def main() -> None:
         bronze_stream = (
             spark.readStream
             .format("delta")
-            .option("withEventTimeOrder", "true")
             .load(BRONZE_PATH)
         )
         parsed = parse_and_validate(bronze_stream)
@@ -173,7 +174,7 @@ def main() -> None:
             .option("checkpointLocation", SILVER_CHECKPOINT_PATH)
             .start(SILVER_PATH)
         )
-        silver_query.awaitTermination()
+        spark.streams.awaitAnyTermination()
     except Exception:
         logger.exception("Silver aggregation stopped with an error")
         raise

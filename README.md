@@ -9,7 +9,9 @@ Ratchet → Redpanda reservation.events.v1 → Spark Structured Streaming → De
 Nexa consumes the topic as an independent consumer. It stores one append-only
 Bronze row per Kafka record, preserving the original JSON value and the Kafka
 metadata needed for traceability. Silver reads Bronze as a separate streaming
-query and writes only validated, bounded aggregates; it never changes Bronze.
+query and writes window aggregates after basic validation; it never changes
+Bronze. Window state is bounded, but the current event-ID deduplication state
+is not.
 
 ## Requirements
 
@@ -157,19 +159,50 @@ valid Ratchet event without one. Invalid rows remain available in Bronze and
 are reported by the Silver query's console warning stream. There is no
 rejected-data table in this milestone.
 
+This is basic validation, not full enforcement of the Ratchet contract: UUID
+format, Kafka key/resource consistency, JSON scalar types, explicit timestamp
+timezone, complete per-type payloads, and excessive future event times are not
+yet checked. In particular, a far-future `occurredAt` can advance the watermark
+and cause later input to be treated as late. Do not treat these aggregates as
+production-ready anomaly inputs.
+
+Both streaming queries are supervised: a failure in either the aggregate sink
+or the invalid-event console stream propagates and stops the job. The console
+stream has no persistent checkpoint and can repeat warnings after a restart;
+Bronze, not the console output, is the durable invalid-event evidence.
+
 The Silver output is an append-only Delta table with these columns:
 
 | Column | Meaning |
 |---|---|
 | `window_start`, `window_end` | Five-minute tumbling event-time window |
 | `event_type` | Valid Ratchet event type |
-| `event_count` | Valid events after `eventId` deduplication within the bounded state |
+| `event_count` | Accepted events after checkpoint-scoped `eventId` deduplication |
 | `distinct_users` | Approximate distinct `holderRef` count using HLL, `rsd = 0.05` |
 
 The query uses `occurredAt` as event time and a five-minute watermark. A late
 event inside that bound can update an open window; an event arriving after the
 window has been finalized is dropped by Spark's bounded state. HLL saves memory
 for the user estimate; it is not the event deduplication mechanism.
+
+`dropDuplicates(["eventId"])` retains IDs across batches for the lifetime of
+the checkpoint; the watermark does not evict those IDs because event time is
+not part of this operator's key. State therefore grows with distinct IDs even
+after old windows close. This is not durable business uniqueness independent
+of the checkpoint, nor does it detect conflicting payloads for the same ID.
+See Spark's [streaming deduplication documentation](https://spark.apache.org/docs/3.5.8/structured-streaming-programming-guide.html#streaming-deduplication).
+
+The initial Bronze snapshot is not guaranteed to arrive in event-time order.
+The previously supplied `withEventTimeOrder` option is not implemented by the
+pinned OSS Delta 3.3.0 reader; it has been removed rather than presented as a
+safety guarantee. A snapshot spanning multiple batches can interact with the
+watermark, so the existing small-snapshot test does not establish complete
+historical aggregation. See the pinned [Delta reader options](https://github.com/delta-io/delta/blob/v3.3.0/spark/src/main/scala/org/apache/spark/sql/delta/DeltaOptions.scala).
+
+The table groups by window and event type, not resource, and does not persist
+curated individual events. Changing this layout or the stateful operators
+requires an explicit migration with separate output/checkpoint paths; do not
+delete or reuse the current checkpoint to make a changed query start.
 
 ## Inspect Bronze
 

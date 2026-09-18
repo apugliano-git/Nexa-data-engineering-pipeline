@@ -59,7 +59,6 @@ def start_silver_query(spark, bronze_path, silver_path, checkpoint_path):
     bronze_stream = (
         spark.readStream
         .format("delta")
-        .option("withEventTimeOrder", "true")
         .load(bronze_path)
     )
     return (
