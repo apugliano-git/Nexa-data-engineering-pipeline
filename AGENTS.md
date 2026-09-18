@@ -1,194 +1,201 @@
 # AGENTS.md — Nexa
 
-## Propósito del proyecto
+## Project purpose
 
-Nexa es un pipeline self-hosted de Data Engineering que procesa eventos reales
-de reservas publicados por Ratchet.
+Nexa is a self-hosted Data Engineering pipeline that processes real
+reservation events published by Ratchet.
 
-Su arquitectura prevista es:
+The planned architecture is:
 
 Ratchet
 → Redpanda/Kafka
 → Spark Structured Streaming
 → Delta Lake Bronze
 → Delta Lake Silver
-→ detección determinística de anomalías
+→ deterministic anomaly detection
 → DuckDB Gold
-→ generación periódica de reportes
-→ API protegida mediante tokens de Cypher
+→ periodic report generation
+→ API protected by Cypher tokens
 
-El núcleo del proyecto es la ingeniería de datos: ingesta, streaming,
-transformación, arquitectura medallion, tolerancia a fallos, trazabilidad y
-verificación. La capa LLM es complementaria: redacta explicaciones, pero nunca
-decide qué constituye una anomalía.
+The core of the project is Data Engineering: ingestion, streaming,
+transformation, medallion architecture, fault tolerance, traceability, and
+verification. The LLM layer is optional: it writes explanations, but it never
+decides what is an anomaly.
 
-Todo debe funcionar localmente y con costo permanente cero.
+Everything must run locally with permanent zero cost.
 
-## Fuentes de verdad
+## Sources of truth
 
-Antes de proponer o implementar cambios sustanciales, inspeccioná:
+Before proposing or implementing substantial changes, inspect:
 
-1. El código y los tests actuales.
-2. `git status`, el diff y el historial reciente.
-3. `docs/bitacora-nexa.md`.
-4. `README.md`.
-5. `Proyecto_Nexa.md`, cuando exista localmente.
+1. The current code and tests.
+2. git status, the diff, and recent history.
+3. docs/bitacora-nexa.md.
+4. README.md.
+5. Proyecto_Nexa.md, when it exists locally.
 
-Aplicá esta precedencia:
+Use this order of authority:
 
-- Código, tests y Git: estado realmente implementado.
-- Bitácora: decisiones, aprendizaje y cierres verificados.
-- README: instalación, operación y uso público actual.
-- Proyecto_Nexa.md: visión y planificación privada, que puede contener estados
-  históricos desactualizados.
+- Code, tests, and Git: what is really implemented.
+- The learning log: decisions, learning, and verified closures.
+- README: current public installation, operation, and use.
+- Proyecto_Nexa.md: private planning and historical intentions.
 
-No repitas como vigente una afirmación contradicha por evidencia más reciente.
+Do not repeat a claim as current when newer evidence contradicts it.
 
-`Proyecto_Nexa.md` está ignorado localmente y es privado. No lo publiques,
-agregues a Git ni modifiques salvo que la tarea sea explícitamente revisar o
-actualizar la planificación.
+Proyecto_Nexa.md is ignored locally and is private. Do not publish it, add it
+to Git, or modify it unless the task explicitly asks to review or update the
+plan.
 
-## Estado base conocido
+## Known baseline
 
-Como referencia histórica, no como sustituto de la inspección:
+These are historical references, not a replacement for inspection:
 
-- Hito 1 estableció Spark 3.5.8, Python 3.10, Java 17 y ejecución `local[2]`.
-- Hito 2 implementó Redpanda/Kafka → Spark Structured Streaming → Delta Bronze.
-- El commit de cierre del Hito 2 es
-  `5aaf17e feat: implement Bronze streaming ingestion`.
-- Bronze conserva el JSON original y los metadatos Kafka necesarios.
-- Bronze y sus checkpoints viven bajo `data/`, que no debe versionarse.
-- El próximo trabajo originalmente previsto era Silver, ventanas, watermark y
-  conteo aproximado, pero el roadmap debe verificarse antes de asumirlo vigente.
+- Milestone 1 established Spark 3.5.8, Python 3.10, Java 17, and local[2].
+- Milestone 2 implemented Redpanda/Kafka → Spark Structured Streaming → Delta
+  Bronze.
+- The Milestone 2 closing commit is 5aaf17e feat: implement Bronze streaming
+  ingestion.
+- Bronze keeps the original JSON and the Kafka metadata needed for traceability.
+- Bronze and its checkpoints live under data/, which must not be versioned.
+- The original next step was Silver, windows, watermarking, and approximate
+  counts, but the roadmap must be checked before assuming it is current.
 
-## Integraciones y contratos
+## Integrations and contracts
 
-Ratchet es la única fuente de datos de Nexa:
+Ratchet is Nexa's only data source:
 
-- Tópico: `reservation.events.v1`.
-- Kafka message key: `resourceId`.
-- Contrato JSON versionado mediante `eventVersion`.
-- Tipos conocidos:
-  - `RESERVATION_HOLD_CREATED`
-  - `RESERVATION_CONFIRMED`
-  - `RESERVATION_RELEASED`
-  - `RESERVATION_EXPIRED`
-  - `RESERVATION_REJECTED`
-- `eventId` identifica el evento.
-- `holdId` identifica una reserva retenida y no existe necesariamente en todos
-  los tipos, especialmente en `RESERVATION_REJECTED`.
-- Ratchet publica con entrega at-least-once; los consumidores de negocio deben
-  considerar duplicados por `eventId`.
+- Topic: reservation.events.v1.
+- Kafka message key: resourceId.
+- JSON contract versioned through eventVersion.
+- Known types:
+  - RESERVATION_HOLD_CREATED
+  - RESERVATION_CONFIRMED
+  - RESERVATION_RELEASED
+  - RESERVATION_EXPIRED
+  - RESERVATION_REJECTED
+- eventId identifies an event.
+- holdId identifies a held reservation and is not present in every type,
+  especially RESERVATION_REJECTED.
+- Ratchet publishes with at-least-once delivery; business consumers must handle
+  duplicates by eventId.
 
-Nexa es consumidor puro. No llama a Ratchet por REST, no escribe en sus bases
-y no modifica Ratchet salvo autorización explícita para una tarea separada.
+Nexa is a read-only consumer. It does not call Ratchet by REST, write to its
+databases, or modify Ratchet unless a separate task explicitly authorizes it.
 
-Cypher no participa en el pipeline interno. Su función futura se limita a
-proteger la API externa mediante validación local de JWT RS256 contra su JWKS.
+Cypher is not part of the internal pipeline. Its future role is limited to
+protecting the external API through local JWT RS256 validation against its JWKS.
 
-## Restricciones arquitectónicas
+## Architectural constraints
 
-- Infraestructura con costo permanente cero.
-- Todo self-hosted y reproducible con Docker Compose.
-- Python/PySpark como lenguaje principal.
-- Spark Structured Streaming y Delta Lake para Bronze/Silver.
-- DuckDB como candidato para Gold, sujeto a revisión antes de implementarlo.
-- Reglas determinísticas y auditables para detectar anomalías.
-- El LLM puede explicar resultados ya calculados; nunca clasificarlos.
-- No implementar hitos futuros anticipadamente.
-- No agregar servicios, dependencias, abstracciones o configuraciones
-  especulativas.
-- No usar Databricks, Snowflake, Confluent Cloud, Redpanda Cloud ni otro SaaS
-  pago como dependencia de v1.
-- Verificar compatibilidad y comportamiento con documentación oficial de las
-  versiones realmente utilizadas.
+- Permanent zero-cost infrastructure.
+- Fully self-hosted and reproducible with Docker Compose.
+- Python/PySpark as the main language.
+- Spark Structured Streaming and Delta Lake for Bronze/Silver.
+- DuckDB as a Gold candidate, subject to review before implementation.
+- Deterministic and auditable anomaly rules.
+- The LLM may explain calculated results, but never classify them.
+- Do not implement future milestones early.
+- Do not add speculative services, dependencies, abstractions, or settings.
+- Do not use Databricks, Snowflake, Confluent Cloud, Redpanda Cloud, or another
+  paid SaaS service as a v1 dependency.
+- Check compatibility and behavior against official documentation for the
+  versions actually used.
 
-## Metodología de aprendizaje
+## Learning and implementation method
 
-Para un nuevo hito o concepto sustancial, usar:
+For a new milestone or substantial concept, use this learning loop:
 
-explicación
-→ explicación del usuario con sus propias palabras
-→ corrección de dudas
-→ diseño breve
-→ una aprobación explícita
-→ implementación
-→ verificación
-→ revisión del diff
-→ documentación
-→ commit autorizado
+explanation
+→ the user's answers to questions about the explanation
+→ correction of doubts and another explanation by the user
+→ the next small concept
+→ a short design
+→ one explicit approval
+→ implementation
+→ verification
+→ diff review
+→ documentation
 
-No convertir detalles triviales en clases teóricas.
+Do not turn trivial details into lessons. Use simple English that matches the
+user's current level and explain important technical decisions clearly.
 
-Antes de implementar un hito, presentar en el chat:
+Before implementing a milestone, explain in the chat:
 
-- qué se construirá;
-- por qué es necesario;
-- qué archivos cambiarán;
-- cómo se verificará;
-- qué queda explícitamente afuera.
+- what will be built;
+- why it is needed;
+- which files will change;
+- how it will be verified;
+- what is explicitly out of scope.
 
-Esperar una sola aprobación explícita del diseño. No crear documentos
-intermedios solo para solicitar otra aprobación equivalente.
+Wait for one explicit design approval. Do not create extra documents only to
+request an equivalent approval.
 
-Si la explicación del usuario contiene un error, corregirlo con evidencia. No
-aceptarlo por deferencia.
+If the user's explanation contains an error, correct it with evidence. Do not
+agree just to be polite.
 
-## Implementación y pruebas
+At the end of a milestone:
 
-- Buscar primero patrones y helpers existentes.
-- Preferir funciones nativas de Spark, Python y las dependencias ya instaladas.
-- Para lógica no trivial, escribir primero la comprobación mínima que pueda
-  fallar.
-- Para infraestructura, dejar una validación ejecutable equivalente.
-- Probar casos negativos, recuperación y límites relevantes, no solo el caso
-  feliz.
-- No borrar checkpoints o datos reales para hacer pasar una prueba.
-- Usar rutas temporales para pruebas destructivas o de recuperación.
-- No afirmar que algo funciona sin una verificación reciente.
-- Distinguir propiedades respaldadas por documentación de comportamientos
-  demostrados experimentalmente.
-- Watermarking, checkpointing y detección de anomalías requieren una revisión
-  independiente antes del commit.
+- document only what the user actually understood or said, plus verified code,
+  tests, and limits;
+- review the complete diff;
+- prepare a copy-paste review prompt for Astra's main chat;
+- do not claim that self-review is independent review.
 
-## Documentación
+## Implementation and tests
 
-Mantener únicamente:
+- Look for existing patterns and helpers first.
+- Prefer native Spark, Python, and already-installed dependencies.
+- For non-trivial logic, write the smallest check that can fail before the
+  implementation.
+- For infrastructure, leave an executable equivalent validation.
+- Test negative cases, recovery, and relevant limits, not only the happy path.
+- Do not delete checkpoints or real data to make a test pass.
+- Use temporary paths for destructive or recovery tests.
+- Do not claim that something works without recent verification.
+- Separate properties supported by documentation from behavior demonstrated by
+  an experiment.
+- Watermarking, checkpointing, and anomaly detection require an independent
+  review before the commit.
 
-- `README.md`: documentación pública y operativa, siempre en inglés.
-- `docs/bitacora-nexa.md`: decisiones, aprendizaje y cierres, en español.
-- `Proyecto_Nexa.md`: planificación privada, ignorada por Git.
+## Documentation
 
-No crear specs, ADRs, reportes o planes paralelos salvo necesidad concreta y
-aprobación explícita.
+Maintain only:
 
-No inventar texto presentado como si fuera la explicación personal del usuario.
-La bitácora debe reflejar lo que realmente entendió y expresó.
+- README.md: public and operational documentation, in English.
+- docs/bitacora-nexa.md: learning, decisions, and closures, in English.
+- Proyecto_Nexa.md: private planning, ignored by Git, in English.
 
-## Git y seguridad
+Do not create specs, ADRs, reports, or parallel plans without a concrete need
+and explicit approval.
 
-- Preservar cambios ajenos.
-- No usar operaciones destructivas para limpiar el workspace.
-- Revisar `git status`, `git diff`, `git diff --cached` y el diff completo antes
-  de commitear.
-- Commits pequeños, completos y con mensajes en inglés.
-- No hacer commit ni push sin autorización explícita.
-- Nunca versionar `data/`, checkpoints, archivos Delta generados, caches,
-  secretos, `.env` ni documentación privada.
-- No iniciar simultáneamente escritores Desktop y CLI sobre la misma sesión.
+Do not invent text and present it as the user's personal explanation. The
+learning log must reflect what the user really understood and expressed.
 
-## Comunicación
+## Git and safety
 
-Responder en español, salvo contenido que deba quedar en inglés dentro del
-repositorio.
+- Preserve other people's changes.
+- Do not use destructive operations to clean the workspace.
+- Before committing, review git status, git diff, git diff --cached, and the
+  complete final diff.
+- Keep commits small and complete, with English messages.
+- Do not commit or push without separate explicit authorization.
+- Never version data/, checkpoints, generated Delta files, caches, secrets,
+  .env, or private documentation.
+- Do not start Desktop and CLI writers at the same time for the same session.
 
-Diferenciar claramente:
+## Communication
 
-- hechos verificados;
-- supuestos;
-- recomendaciones;
-- decisiones pendientes.
+Speak English with the user. Use simple wording and correct important English
+mistakes briefly when useful.
 
-Ser directo, didáctico y crítico. Priorizar la solución mínima correcta y
-reproducible. Ante una ambigüedad que cambie materialmente el resultado,
-consultar al usuario en vez de inventar la decisión.
+Clearly separate:
+
+- verified facts;
+- assumptions;
+- recommendations;
+- pending decisions.
+
+Be direct, educational, and critical. Prefer the smallest correct and
+reproducible solution. When ambiguity would materially change the result, ask
+the user instead of inventing a decision.

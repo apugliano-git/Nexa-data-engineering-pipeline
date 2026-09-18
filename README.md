@@ -1,5 +1,16 @@
 # Nexa — Milestones 2 and 3
 
+## Current verified state
+
+The current repository is at commit bb6a6ee. Milestones 1 and 2 are
+implemented. The historical Milestone 3 aggregate job is implemented and its
+known limits are documented below. A durable event-level Silver table and a
+quarantine table do not exist yet; they are the next learning task.
+
+The current worktree and origin/main matched during the September 18, 2026
+audit. Existing Bronze data and its checkpoint were preserved. No migration or
+cutover of the aggregate Silver table was performed.
+
 Milestones 2 and 3 implement the ingestion and first curation paths:
 
 ```text

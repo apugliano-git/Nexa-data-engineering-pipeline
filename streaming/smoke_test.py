@@ -20,31 +20,31 @@ def read_java_version():
     output = result.stdout + result.stderr
     match = re.search(r'version "([^"]+)"', output)
     if match is None:
-        raise RuntimeError("No se pudo determinar la versión de Java")
+        raise RuntimeError("Could not determine the Java version")
     return match.group(1)
 
 
 def main():
     java_version = read_java_version()
     if not java_version.startswith("17."):
-        raise AssertionError(f"Java inesperado: {java_version}")
+        raise AssertionError(f"Unexpected Java version: {java_version}")
     if sys.version_info[:2] != EXPECTED_PYTHON:
         raise AssertionError(
-            f"Python inesperado: {sys.version_info.major}.{sys.version_info.minor}"
+            f"Unexpected Python version: {sys.version_info.major}.{sys.version_info.minor}"
         )
 
-    spark = SparkSession.builder.appName("nexa-hito-1-smoke-test").getOrCreate()
+    spark = SparkSession.builder.appName("nexa-milestone-1-smoke-test").getOrCreate()
     try:
         if spark.version != EXPECTED_SPARK:
-            raise AssertionError(f"Spark inesperado: {spark.version}")
+            raise AssertionError(f"Unexpected Spark version: {spark.version}")
         if spark.sparkContext.master != EXPECTED_MASTER:
             raise AssertionError(
-                f"Master inesperado: {spark.sparkContext.master}"
+                f"Unexpected Spark master: {spark.sparkContext.master}"
             )
 
         count = spark.range(1).count()
         if count != 1:
-            raise AssertionError(f"Resultado inesperado: {count}")
+            raise AssertionError(f"Unexpected result: {count}")
 
         print(
             "NEXA_SMOKE_TEST_OK "
