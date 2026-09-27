@@ -1,20 +1,22 @@
-# Nexa — Milestones 2 and 3
+# Nexa — Milestones 2 through 4
 
 ## Current verified state
 
-The current repository is at commit bb6a6ee. Milestones 1 and 2 are
-implemented. The historical Milestone 3 aggregate job is implemented and its
-known limits are documented below. A durable event-level Silver table and a
-quarantine table do not exist yet; they are the next learning task.
+Milestones 1 and 2 are implemented. The historical Milestone 3 aggregate job
+is preserved, and Milestone 4 now adds a separate durable event-level Silver
+job with a durable quarantine table. The existing aggregate table and
+checkpoint are not migrated or replaced.
 
-The current worktree and origin/main matched during the September 18, 2026
-audit. Existing Bronze data and its checkpoint were preserved. No migration or
-cutover of the aggregate Silver table was performed.
+At the September 18, 2026 pre-H4 audit, the worktree and origin/main matched.
+That audit preserved existing Bronze data and its checkpoint. H4 still does
+not migrate data or cut over the aggregate Silver table.
 
-Milestones 2 and 3 implement the ingestion and first curation paths:
+Milestones 2 through 4 implement these paths:
 
 ```text
-Ratchet → Redpanda reservation.events.v1 → Spark Structured Streaming → Delta Lake Bronze → Delta Lake Silver
+Ratchet → Redpanda → Spark Structured Streaming → Delta Lake Bronze
+                                                     ├→ historical aggregate Silver
+                                                     └→ event Silver and quarantine
 ```
 
 Nexa consumes the topic as an independent consumer. It stores one append-only
@@ -49,10 +51,10 @@ the container's temporary `/tmp/.ivy2` directory.
 ## Local storage permissions
 
 The Compose file includes a one-shot `spark-bronze-init` service. It runs as
-root only long enough to create `data/bronze`, `data/silver`, and both
-checkpoint directories, assign them to UID/GID `185`, and set mode `0755`. It
-does not delete, replace, or initialize existing Bronze, Silver, or checkpoint
-files.
+root only long enough to create the Bronze, both Silver outputs, the
+quarantine output, and their checkpoint directories, assign them to UID/GID
+`185`, and set mode `0755`. It does not delete, replace, or initialize existing
+Delta tables or checkpoints.
 
 The `spark-bronze` service still runs as the image's default `spark` user. No
 manual `chmod 777` or permanent root execution is required. The initializer is
@@ -126,10 +128,13 @@ The host directories are bind-mounted so they survive container restarts:
 ```text
 data/
 ├── bronze/                  # Delta table data and _delta_log
-├── silver/                  # Delta table data and _delta_log
+├── silver/                  # Historical aggregate Delta table
+├── silver_events/           # Durable event-level Silver Delta table
+├── quarantine_events/       # Invalid/conflicting Bronze publications
 └── checkpoint/
     ├── bronze/              # Bronze Spark checkpoint
-    └── silver/              # Silver Spark checkpoint
+    ├── silver/              # Historical aggregate checkpoint
+    └── silver_events/       # Event-level Silver checkpoint
 ```
 
 `data/` is generated local state and is ignored by Git.
@@ -148,7 +153,54 @@ Bronze has exactly these columns:
 No business deduplication is performed in Bronze. `eventId`, `eventType`, and
 `holdId` remain inside the raw JSON value for later layers.
 
-## Run Silver aggregation
+## Run event-level Silver
+
+This is the current event-quality path. Start Bronze first, then start the
+separate event-level service:
+
+```bash
+docker compose up -d spark-bronze
+docker compose up -d spark-silver-events
+docker compose logs -f spark-silver-events
+```
+
+The service reads the committed Bronze Delta table, not Kafka directly. Its
+checkpoint is `data/checkpoint/silver_events`, and its outputs are:
+
+- `data/silver_events`: one accepted row per retained `eventId`;
+- `data/quarantine_events`: invalid or conflicting publications, with the raw
+  Bronze fields, source coordinates, and a stable reason.
+
+Event-level Silver validates the complete Ratchet contract for the five
+supported event types. It checks JSON object shape, scalar types, version,
+UUIDs, the Kafka-key/resource relationship, UTC timestamps, holder references,
+and each event's payload. `RESERVATION_REJECTED` is valid without a `holdId`.
+Compatible additional fields are allowed. Original JSON remains in Bronze.
+
+The job has no watermark. A valid old event remains eligible for event-level
+Silver. Watermarks belong to a later metrics query that may bound window state;
+they do not provide permanent business deduplication.
+
+Valid events are deduplicated by `eventId` against all retained event Silver.
+Existing accepted content wins. For an unseen ID, candidates are ordered by
+Kafka timestamp, topic, partition, and offset. Equivalent JSON with different
+whitespace or key order is one event. Different contractual content for one
+`eventId` is quarantined. Different event IDs sharing a `holdId` remain
+separate events.
+
+Silver and quarantine are separate Delta tables. The job writes both from one
+`foreachBatch` writer and propagates failures. Delta does not provide one
+atomic transaction across the two tables; a retry converges because both
+writes are insert-only MERGE operations. Quarantine is idempotent by
+topic/partition/offset during one topic lifetime. Keep the Silver table to
+keep its uniqueness guarantee, and do not mix a recreated topic into the same
+quarantine dataset.
+
+This job does not change the historical aggregate job. It also does not check
+whether a lifecycle sequence makes business sense; that belongs to later
+anomaly rules.
+
+## Historical Milestone 3 aggregate
 
 Start Bronze first. Silver waits for the Bronze Delta log before starting, so
 the two services can also be started together after the initializer exists:
@@ -304,8 +356,40 @@ docker run --rm -v "$PWD:/workspace:ro" \
   /workspace/streaming/test_silver_stream.py
 ```
 
+The event-level Silver checks are:
+
+```bash
+python3 streaming/test_silver_ingest.py
+
+docker run --rm -v "$PWD:/workspace:ro" \
+  apache/spark:3.5.8-scala2.12-java17-python3-ubuntu \
+  /opt/spark/bin/spark-submit --master local[2] \
+  --py-files /workspace/streaming/silver_ingest.py \
+  --packages io.delta:delta-spark_2.12:3.3.0 \
+  --conf spark.jars.ivy=/tmp/.ivy2 \
+  --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension \
+  --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog \
+  /workspace/streaming/test_silver_ingest_stream.py
+```
+
+Also run `docker compose config --quiet` and `git diff --check`. The current
+verification covers contract cases, duplicates, conflicts, equivalent JSON,
+old events, split snapshots, retries after partial output, restart with the
+same checkpoint, and committed-source readiness. It uses temporary Delta
+directories and does not modify the real `data/` tables.
+
+The new service keeps the image's non-root Spark user. Verify the effective
+UID on a fresh local setup with:
+
+```bash
+docker compose run --rm --no-deps --entrypoint id spark-silver-events -u
+```
+
+The expected UID is `185`.
+
 Milestones 2 and 3 include the continuous Kafka-to-Delta Bronze path, the
-validated Bronze-to-Silver Delta stream, persistent storage, checkpoint
-recovery, bounded event-time aggregation, and the Milestone 1 smoke test. They
-do not include deterministic anomaly detection, Gold/DuckDB, LLM features,
-FastAPI, Cypher, or changes to Ratchet.
+historical aggregate experiment, persistent storage, checkpoint recovery,
+bounded event-time aggregation, and the Milestone 1 smoke test. Milestone 4
+adds event-level Silver and quarantine. None of these milestones include
+deterministic anomaly detection, Gold/DuckDB, LLM features, FastAPI, Cypher,
+or changes to Ratchet.

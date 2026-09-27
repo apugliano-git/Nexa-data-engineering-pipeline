@@ -73,6 +73,37 @@ services:
     networks:
       - ecosistema-network
 
+  spark-silver-events:
+    image: apache/spark:3.5.8-scala2.12-java17-python3-ubuntu
+    depends_on:
+      spark-bronze-init:
+        condition: service_completed_successfully
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - local[2]
+      - --py-files
+      - /opt/spark/work-dir/silver_ingest.py
+      - --packages
+      - io.delta:delta-spark_2.12:3.3.0
+      - --conf
+      - spark.jars.ivy=/tmp/.ivy2
+      - --conf
+      - spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension
+      - --conf
+      - spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog
+      - /opt/spark/work-dir/silver_ingest.py
+    volumes:
+      - type: bind
+        source: ./streaming/silver_ingest.py
+        target: /opt/spark/work-dir/silver_ingest.py
+        read_only: true
+      - type: bind
+        source: ./data
+        target: /opt/nexa/data
+    networks:
+      - ecosistema-network
+
   spark-bronze-init:
     image: apache/spark:3.5.8-scala2.12-java17-python3-ubuntu
     user: "0:0"
@@ -80,9 +111,9 @@ services:
       - /bin/sh
       - -c
       - |
-        mkdir -p /opt/nexa/data/bronze /opt/nexa/data/silver /opt/nexa/data/checkpoint/bronze /opt/nexa/data/checkpoint/silver
-        chown 185:185 /opt/nexa/data /opt/nexa/data/bronze /opt/nexa/data/silver /opt/nexa/data/checkpoint /opt/nexa/data/checkpoint/bronze /opt/nexa/data/checkpoint/silver
-        chmod 0755 /opt/nexa/data /opt/nexa/data/bronze /opt/nexa/data/silver /opt/nexa/data/checkpoint /opt/nexa/data/checkpoint/bronze /opt/nexa/data/checkpoint/silver
+        mkdir -p /opt/nexa/data/bronze /opt/nexa/data/silver /opt/nexa/data/silver_events /opt/nexa/data/quarantine_events /opt/nexa/data/checkpoint/bronze /opt/nexa/data/checkpoint/silver /opt/nexa/data/checkpoint/silver_events
+        chown 185:185 /opt/nexa/data /opt/nexa/data/bronze /opt/nexa/data/silver /opt/nexa/data/silver_events /opt/nexa/data/quarantine_events /opt/nexa/data/checkpoint /opt/nexa/data/checkpoint/bronze /opt/nexa/data/checkpoint/silver /opt/nexa/data/checkpoint/silver_events
+        chmod 0755 /opt/nexa/data /opt/nexa/data/bronze /opt/nexa/data/silver /opt/nexa/data/silver_events /opt/nexa/data/quarantine_events /opt/nexa/data/checkpoint /opt/nexa/data/checkpoint/bronze /opt/nexa/data/checkpoint/silver /opt/nexa/data/checkpoint/silver_events
     volumes:
       - type: bind
         source: ./data
