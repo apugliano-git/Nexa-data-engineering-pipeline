@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -17,6 +18,15 @@ EVENT_SILVER_PATH = "/opt/nexa/data/silver_events"
 QUARANTINE_PATH = "/opt/nexa/data/quarantine_events"
 EVENT_SILVER_CHECKPOINT_PATH = "/opt/nexa/data/checkpoint/silver_events"
 MAX_OCCURRED_AT_AHEAD = timedelta(minutes=5)
+JAVA_INT_MIN = -(2**31)
+JAVA_INT_MAX = 2**31 - 1
+UTC_TIMESTAMP = re.compile(
+    r"^(?P<prefix>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"
+    r"(?P<fraction>\.\d{1,9})?(?P<zone>Z|[+-]\d{2}:\d{2})$"
+)
+UTC_TIMESTAMP_WITHOUT_ZONE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?$"
+)
 UTC = timezone.utc
 logger = logging.getLogger("nexa.silver_events")
 
@@ -100,14 +110,38 @@ def _canonical_uuid(value):
 
 def _parse_utc(value, field_name):
     if not isinstance(value, str):
-        return None, f"invalid_{field_name}_type"
+        return (None, None, None), f"invalid_{field_name}_type"
+    match = UTC_TIMESTAMP.fullmatch(value)
+    if match is None:
+        if UTC_TIMESTAMP_WITHOUT_ZONE.fullmatch(value):
+            return (None, None, None), f"{field_name}_not_utc"
+        return (None, None, None), f"invalid_{field_name}"
+    fraction_digits = (match.group("fraction") or "")[1:]
+    fraction_nanoseconds = int(fraction_digits.ljust(9, "0") or "0")
+    microseconds = fraction_digits[:6].ljust(6, "0")
+    zone = match.group("zone")
+    zone_for_python = "+00:00" if zone == "Z" else zone
+    python_value = match.group("prefix")
+    if fraction_digits:
+        python_value += f".{microseconds}"
+    python_value += zone_for_python
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(python_value)
     except ValueError:
-        return None, f"invalid_{field_name}"
+        return (None, None, None), f"invalid_{field_name}"
     if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
-        return None, f"{field_name}_not_utc"
-    return parsed.astimezone(UTC), None
+        return (None, None, None), f"{field_name}_not_utc"
+    parsed = parsed.astimezone(UTC)
+    if fraction_nanoseconds % 1000 == 0:
+        canonical = parsed.isoformat().replace("+00:00", "Z")
+    else:
+        canonical = parsed.strftime("%Y-%m-%dT%H:%M:%S")
+        canonical += f".{fraction_nanoseconds:09d}Z"
+    return (parsed, canonical, fraction_nanoseconds % 1000), None
+
+
+def _timestamp_after(left, left_extra_nanoseconds, right, right_extra_nanoseconds):
+    return (left, left_extra_nanoseconds) > (right, right_extra_nanoseconds)
 
 
 def _source_timestamp(value):
@@ -128,7 +162,7 @@ def _required_uuid(payload, name):
     return _canonical_uuid(payload[name]), None
 
 
-def _canonical_payload(event_type, payload, typed):
+def _canonical_payload(event_type, typed, canonical_timestamps):
     fields = {
         "RESERVATION_HOLD_CREATED": ("holdId", "expiresAt"),
         "RESERVATION_CONFIRMED": ("holdId",),
@@ -138,7 +172,7 @@ def _canonical_payload(event_type, payload, typed):
     }[event_type]
     canonical = {}
     for field in fields:
-        value = typed[field]
+        value = canonical_timestamps.get(field, typed[field])
         if isinstance(value, datetime):
             value = value.isoformat().replace("+00:00", "Z")
         canonical[field] = value
@@ -185,7 +219,9 @@ def validate_publication(record):
 
     if "occurredAt" not in event:
         return _invalid(result, "missing_occurred_at")
-    occurred_at, error = _parse_utc(event["occurredAt"], "occurred_at")
+    (occurred_at, occurred_at_canonical, occurred_at_extra_nanoseconds), error = _parse_utc(
+        event["occurredAt"], "occurred_at"
+    )
     if error:
         return _invalid(result, error)
 
@@ -205,7 +241,12 @@ def validate_publication(record):
     kafka_timestamp = _source_timestamp(record.get("timestamp"))
     if kafka_timestamp is None:
         return _invalid(result, "missing_kafka_timestamp")
-    if occurred_at > kafka_timestamp + MAX_OCCURRED_AT_AHEAD:
+    if _timestamp_after(
+        occurred_at,
+        occurred_at_extra_nanoseconds,
+        kafka_timestamp + MAX_OCCURRED_AT_AHEAD,
+        0,
+    ):
         return _invalid(result, "occurred_at_after_kafka_timestamp")
 
     holder_ref = event.get("holderRef")
@@ -230,6 +271,7 @@ def validate_publication(record):
         "requestedUnits": None,
         "availableUnits": None,
     }
+    canonical_timestamps = {}
 
     if event_type != "RESERVATION_REJECTED":
         typed["holdId"], error = _required_uuid(payload, "holdId")
@@ -239,13 +281,21 @@ def validate_publication(record):
     if event_type == "RESERVATION_HOLD_CREATED":
         if "expiresAt" not in payload:
             return _invalid(result, "missing_expires_at")
-        typed["expiresAt"], error = _parse_utc(payload["expiresAt"], "expires_at")
+        (
+            typed["expiresAt"],
+            canonical_timestamps["expiresAt"],
+            _,
+        ), error = _parse_utc(payload["expiresAt"], "expires_at")
         if error:
             return _invalid(result, error)
     elif event_type == "RESERVATION_EXPIRED":
         if "scheduledExpiresAt" not in payload:
             return _invalid(result, "missing_scheduled_expires_at")
-        typed["scheduledExpiresAt"], error = _parse_utc(
+        (
+            typed["scheduledExpiresAt"],
+            canonical_timestamps["scheduledExpiresAt"],
+            _,
+        ), error = _parse_utc(
             payload["scheduledExpiresAt"], "scheduled_expires_at"
         )
         if error:
@@ -265,6 +315,8 @@ def validate_publication(record):
             return _invalid(result, "missing_available_units")
         if isinstance(available_units, bool) or not isinstance(available_units, int):
             return _invalid(result, "invalid_available_units_type")
+        if not JAVA_INT_MIN <= available_units <= JAVA_INT_MAX:
+            return _invalid(result, "available_units_out_of_range")
         if available_units > 0:
             return _invalid(result, "invalid_available_units")
         typed["reason"] = payload["reason"]
@@ -288,10 +340,10 @@ def validate_publication(record):
         "eventId": result["eventId"],
         "eventType": event_type,
         "eventVersion": event_version,
-        "occurredAt": occurred_at.isoformat().replace("+00:00", "Z"),
+        "occurredAt": occurred_at_canonical,
         "resourceId": resource_id,
         "holderRef": holder_ref,
-        "payload": _canonical_payload(event_type, payload, typed),
+        "payload": _canonical_payload(event_type, typed, canonical_timestamps),
     }
     result["canonical_json"] = json.dumps(
         canonical_content, sort_keys=True, separators=(",", ":"), ensure_ascii=False

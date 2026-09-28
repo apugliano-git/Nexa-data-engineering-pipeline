@@ -21,10 +21,12 @@ Ratchet → Redpanda → Spark Structured Streaming → Delta Lake Bronze
 
 Nexa consumes the topic as an independent consumer. It stores one append-only
 Bronze row per Kafka record, preserving the original JSON value and the Kafka
-metadata needed for traceability. Silver reads Bronze as a separate streaming
-query and writes window aggregates after basic validation; it never changes
-Bronze. Window state is bounded, but the current event-ID deduplication state
-is not.
+metadata needed for traceability. The historical H3 aggregate service reads
+Bronze as a separate streaming query and writes window aggregates after basic
+validation; it never changes Bronze. Its window state is bounded, but its
+checkpoint-scoped event-ID state is not durable business uniqueness. H4 adds a
+separate event-level Silver path below; it is the trusted event source for
+future metrics.
 
 ## Requirements
 
@@ -177,6 +179,23 @@ UUIDs, the Kafka-key/resource relationship, UTC timestamps, holder references,
 and each event's payload. `RESERVATION_REJECTED` is valid without a `holdId`.
 Compatible additional fields are allowed. Original JSON remains in Bronze.
 
+Ratchet serializes Java `Instant` values with whole seconds or 3, 6, or 9
+fractional digits. Event-level Silver accepts that precision and equivalent
+UTC spellings, and stores Spark timestamp columns at their documented
+microsecond precision. For instants exactly representable at microsecond
+precision, `canonical_json` keeps the H4 legacy form: no fraction for whole
+seconds and six fractional digits otherwise. Only genuinely sub-microsecond
+values use nine fractional digits, so exact nanosecond differences remain
+visible without turning retained H4 rows into false conflicts. A value just
+over the five-minute Nexa clock policy is rejected even when the difference is
+one nanosecond. This policy compares with the persisted Kafka timestamp, not
+the current processing clock.
+
+`availableUnits` follows Ratchet's signed Java `int` range of
+`-2147483648` through `2147483647`; a rejected event must also have
+`availableUnits <= 0`. Out-of-range values are quarantined before Spark
+serialization, so a valid Silver row cannot lose this required value.
+
 The job has no watermark. A valid old event remains eligible for event-level
 Silver. Watermarks belong to a later metrics query that may bound window state;
 they do not provide permanent business deduplication.
@@ -199,6 +218,13 @@ quarantine dataset.
 This job does not change the historical aggregate job. It also does not check
 whether a lifecycle sequence makes business sense; that belongs to later
 anomaly rules.
+
+The guarantees above are code and contract guarantees. The temporary local
+tests demonstrate validation, precision handling, deterministic selection,
+split snapshots, same-checkpoint recovery, failure propagation between the two
+writes, replay after both writes, and idempotent convergence. They do not
+demonstrate physical disk loss, sustained load, multiple partitions, or a
+complete HTTP-to-Bronze Ratchet path.
 
 ## Historical Milestone 3 aggregate
 
@@ -359,7 +385,9 @@ docker run --rm -v "$PWD:/workspace:ro" \
 The event-level Silver checks are:
 
 ```bash
-python3 streaming/test_silver_ingest.py
+docker run --rm -v "$PWD:/workspace:ro" \
+  apache/spark:3.5.8-scala2.12-java17-python3-ubuntu \
+  python3 /workspace/streaming/test_silver_ingest.py
 
 docker run --rm -v "$PWD:/workspace:ro" \
   apache/spark:3.5.8-scala2.12-java17-python3-ubuntu \
@@ -373,9 +401,10 @@ docker run --rm -v "$PWD:/workspace:ro" \
 ```
 
 Also run `docker compose config --quiet` and `git diff --check`. The current
-verification covers contract cases, duplicates, conflicts, equivalent JSON,
-old events, split snapshots, retries after partial output, restart with the
-same checkpoint, and committed-source readiness. It uses temporary Delta
+verification covers contract cases, timestamp precision and retained-legacy
+canonical compatibility, duplicates, conflicts, equivalent JSON, old events,
+split snapshots, retries after partial output, restart with the same
+checkpoint, and committed-source readiness. It uses temporary Delta
 directories and does not modify the real `data/` tables.
 
 The new service keeps the image's non-root Spark user. Verify the effective

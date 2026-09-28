@@ -120,6 +120,98 @@ def test_requires_explicit_utc_timestamps():
     assert validate(malformed)["validation_error"] == "invalid_occurred_at"
 
 
+def test_accepts_java_instant_precision_for_all_contract_timestamps():
+    fractions = ("", ".123", ".123456", ".123456789")
+    for fraction in fractions:
+        occurred_at = f"2026-09-20T12:00:00{fraction}Z"
+        confirmed = validate(
+            event(
+                "RESERVATION_CONFIRMED",
+                {"holdId": HOLD_ID},
+                occurredAt=occurred_at,
+            )
+        )
+        assert confirmed["valid"] is True
+
+        created = validate(
+            event(
+                "RESERVATION_HOLD_CREATED",
+                {"holdId": HOLD_ID, "expiresAt": f"2026-09-20T12:15:00{fraction}Z"},
+                occurredAt=occurred_at,
+            )
+        )
+        assert created["valid"] is True
+
+        expired = validate(
+            event(
+                "RESERVATION_EXPIRED",
+                {
+                    "holdId": HOLD_ID,
+                    "scheduledExpiresAt": f"2026-09-20T12:15:00{fraction}Z",
+                },
+                occurredAt=occurred_at,
+            )
+        )
+        assert expired["valid"] is True
+
+    short = validate(
+        event(
+            "RESERVATION_HOLD_CREATED",
+            {"holdId": HOLD_ID, "expiresAt": "2026-09-20T12:15:00.123Z"},
+            occurredAt="2026-09-20T12:00:00.123Z",
+        )
+    )
+    padded = validate(
+        event(
+            "RESERVATION_HOLD_CREATED",
+            {"holdId": HOLD_ID, "expiresAt": "2026-09-20T12:15:00.123000000Z"},
+            occurredAt="2026-09-20T12:00:00.123000000Z",
+        )
+    )
+    precise = validate(
+        event(
+            "RESERVATION_CONFIRMED",
+            {"holdId": HOLD_ID},
+            occurredAt="2026-09-20T12:00:00.123456789Z",
+        )
+    )
+
+    assert short["canonical_json"] == padded["canonical_json"]
+    assert '"occurredAt":"2026-09-20T12:00:00.123000Z"' in short["canonical_json"]
+    assert '"occurredAt":"2026-09-20T12:00:00.123456Z"' in validate(
+        event(
+            "RESERVATION_CONFIRMED",
+            {"holdId": HOLD_ID},
+            occurredAt="2026-09-20T12:00:00.123456Z",
+        )
+    )["canonical_json"]
+    whole = validate(
+        event(
+            "RESERVATION_CONFIRMED",
+            {"holdId": HOLD_ID},
+            occurredAt="2026-09-20T12:00:00.000000000Z",
+        )
+    )
+    assert '"occurredAt":"2026-09-20T12:00:00Z"' in whole["canonical_json"]
+    assert ".123456789Z" in precise["canonical_json"]
+
+
+def test_applies_future_boundary_with_nanosecond_precision():
+    exactly_five_minutes = event(
+        "RESERVATION_CONFIRMED",
+        {"holdId": HOLD_ID},
+        occurredAt="2026-09-20T12:05:00.000000000Z",
+    )
+    just_over_five_minutes = event(
+        "RESERVATION_CONFIRMED",
+        {"holdId": HOLD_ID},
+        occurredAt="2026-09-20T12:05:00.000000001Z",
+    )
+
+    assert validate(exactly_five_minutes)["valid"] is True
+    assert validate(just_over_five_minutes)["validation_error"] == "occurred_at_after_kafka_timestamp"
+
+
 def test_rejects_invalid_per_event_payloads():
     missing_expiration = event("RESERVATION_HOLD_CREATED", {"holdId": HOLD_ID})
     missing_schedule = event("RESERVATION_EXPIRED", {"holdId": HOLD_ID})
@@ -136,6 +228,37 @@ def test_rejects_invalid_per_event_payloads():
     assert validate(missing_schedule)["validation_error"] == "missing_scheduled_expires_at"
     assert validate(bad_rejection)["validation_error"] == "invalid_rejection_reason"
     assert validate(wrong_requested_units)["validation_error"] == "invalid_requested_units"
+
+
+def test_enforces_ratchet_signed_int_range_for_available_units():
+    minimum = event(
+        "RESERVATION_REJECTED",
+        {
+            "reason": "INSUFFICIENT_AVAILABILITY",
+            "requestedUnits": 1,
+            "availableUnits": -(2**31),
+        },
+    )
+    below_minimum = event(
+        "RESERVATION_REJECTED",
+        {
+            "reason": "INSUFFICIENT_AVAILABILITY",
+            "requestedUnits": 1,
+            "availableUnits": -(2**31) - 1,
+        },
+    )
+    above_maximum = event(
+        "RESERVATION_REJECTED",
+        {
+            "reason": "INSUFFICIENT_AVAILABILITY",
+            "requestedUnits": 1,
+            "availableUnits": 2**31,
+        },
+    )
+
+    assert validate(minimum)["valid"] is True
+    assert validate(below_minimum)["validation_error"] == "available_units_out_of_range"
+    assert validate(above_maximum)["validation_error"] == "available_units_out_of_range"
 
 
 def test_allows_compatible_additional_fields():
